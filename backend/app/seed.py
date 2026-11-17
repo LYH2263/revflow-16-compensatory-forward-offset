@@ -28,6 +28,55 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   note TEXT NOT NULL DEFAULT '',
   settle_run_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS offset_edges (
+  id INTEGER PRIMARY KEY,
+  forward_entry_key TEXT NOT NULL UNIQUE REFERENCES ledger_entries(entry_key),
+  reverse_entry_key TEXT NOT NULL REFERENCES ledger_entries(entry_key),
+  offset_cents INTEGER NOT NULL CHECK (offset_cents > 0),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  reverse_settle_run_id INTEGER REFERENCES settle_runs(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_offset_edges_reverse ON offset_edges(reverse_entry_key);
+CREATE TRIGGER IF NOT EXISTS trg_offset_edges_immutable_update
+BEFORE UPDATE ON offset_edges
+BEGIN
+  SELECT RAISE(ABORT, '对消边不可修改');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_offset_edges_immutable_delete
+BEFORE DELETE ON offset_edges
+BEGIN
+  SELECT RAISE(ABORT, '对消边不可删除');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_compensatory_immutable
+BEFORE UPDATE OF entry_key, account_id, kind, amount_cents, target_entry_key ON ledger_entries
+WHEN EXISTS (SELECT 1 FROM offset_edges o WHERE o.forward_entry_key = OLD.entry_key)
+ AND (
+   NEW.entry_key IS NOT OLD.entry_key
+   OR NEW.account_id IS NOT OLD.account_id
+   OR NEW.kind IS NOT OLD.kind
+   OR NEW.amount_cents IS NOT OLD.amount_cents
+   OR NEW.target_entry_key IS NOT OLD.target_entry_key
+ )
+BEGIN
+  SELECT RAISE(ABORT, '补正向对消绑定后不可改键/账户/金额/类型/引用冲正');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_forward_kind_not_promoted
+BEFORE UPDATE OF kind ON ledger_entries
+WHEN NEW.kind = '补正向' AND OLD.kind <> '补正向'
+BEGIN
+  SELECT RAISE(ABORT, '补正向只能通过补正向登记创建');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_compensatory_required_offset
+BEFORE INSERT ON ledger_entries
+WHEN NEW.kind = '补正向'
+ AND NOT EXISTS (
+   SELECT 1 FROM ledger_entries r
+   WHERE r.entry_key = NEW.target_entry_key AND r.kind = '冲正'
+ )
+BEGIN
+  SELECT RAISE(ABORT, '补正向必须引用一笔真实冲正，不得由普通正向冒充');
+END;
 CREATE TABLE IF NOT EXISTS quarantine_items (
   id INTEGER PRIMARY KEY,
   entry_key TEXT NOT NULL,

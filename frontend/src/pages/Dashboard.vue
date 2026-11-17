@@ -33,6 +33,7 @@ const maxCount = computed(() => {
           <p class="amount">¥ {{ yuan(data.余额合计分) }}</p>
           <p class="hint">
             待归并 {{ data.待归并 }} 笔
+            · 补正向 {{ data.补正向笔数 }} 笔 / 对消边 {{ data.对消边数 }} 条
             <template v-if="data.最近归并">
               · 最近归并 #{{ data.最近归并.id }}（隔离 {{ data.最近归并.quarantine_count }}）
             </template>

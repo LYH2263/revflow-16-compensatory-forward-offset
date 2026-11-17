@@ -12,6 +12,23 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def recompute_account_balance(conn, account_id: int) -> int:
+    """按「全部已归并流水」重算账户余额：正向/补正向记正，冲正记负。
+
+    归并、补正向登记共用此口径，保证余额与流水净额同源。
+    """
+    net = conn.execute(
+        """
+        SELECT COALESCE(SUM(CASE WHEN kind = '冲正' THEN -amount_cents ELSE amount_cents END), 0) AS s
+        FROM ledger_entries
+        WHERE account_id = ? AND status = '已归并'
+        """,
+        (account_id,),
+    ).fetchone()["s"]
+    conn.execute("UPDATE accounts SET balance_cents = ? WHERE id = ?", (net, account_id))
+    return net
+
+
 def dashboard() -> dict:
     with connect() as conn:
         accounts = rows_to_dicts(conn.execute("SELECT * FROM accounts ORDER BY id").fetchall())
@@ -25,12 +42,18 @@ def dashboard() -> dict:
             "SELECT COUNT(*) AS c FROM ledger_entries WHERE status = '待归并'"
         ).fetchone()["c"]
         q = conn.execute("SELECT COUNT(*) AS c FROM quarantine_items").fetchone()["c"]
+        comp = conn.execute(
+            "SELECT COUNT(*) AS c FROM ledger_entries WHERE kind = '补正向'"
+        ).fetchone()["c"]
+        edges = conn.execute("SELECT COUNT(*) AS c FROM offset_edges").fetchone()["c"]
         bal = conn.execute("SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts").fetchone()["s"]
         last = conn.execute("SELECT * FROM settle_runs ORDER BY id DESC LIMIT 1").fetchone()
         return {
             "账户数": len(accounts),
             "正向笔数": fwd,
             "冲正笔数": rev,
+            "补正向笔数": comp,
+            "对消边数": edges,
             "待归并": pending,
             "未平隔离": q,
             "余额合计分": bal,
@@ -45,27 +68,36 @@ def list_accounts() -> list[dict]:
 
 
 def list_entries(kind: str | None = None) -> list[dict]:
+    """正向口径含「补正向」；每行附对消边信息（补正向指向冲正，冲正汇总指向它的补正向）。"""
     with connect() as conn:
-        if kind:
+        # 补正向 → 冲正 是对消边唯一键（1:1）；一笔冲正可被多笔补正向引用（1:N），故冲正侧聚合。
+        base = """
+            SELECT e.*, a.code AS account_code, a.name AS account_name,
+                   (SELECT o.reverse_entry_key FROM offset_edges o
+                     WHERE o.forward_entry_key = e.entry_key) AS offset_reverse_key,
+                   (SELECT GROUP_CONCAT(o.forward_entry_key, ', ') FROM offset_edges o
+                     WHERE o.reverse_entry_key = e.entry_key) AS offset_forward_keys,
+                   (SELECT COUNT(*) FROM offset_edges o
+                     WHERE o.reverse_entry_key = e.entry_key) AS offset_edge_count,
+                   COALESCE(
+                     (SELECT o.offset_cents FROM offset_edges o
+                       WHERE o.forward_entry_key = e.entry_key),
+                     (SELECT SUM(o.offset_cents) FROM offset_edges o
+                       WHERE o.reverse_entry_key = e.entry_key)
+                   ) AS offset_cents,
+                   (SELECT o.created_at FROM offset_edges o
+                     WHERE o.forward_entry_key = e.entry_key) AS offset_created_at
+            FROM ledger_entries e
+            JOIN accounts a ON a.id = e.account_id
+        """
+        if kind == "正向":
             rows = conn.execute(
-                """
-                SELECT e.*, a.code AS account_code, a.name AS account_name
-                FROM ledger_entries e
-                JOIN accounts a ON a.id = e.account_id
-                WHERE e.kind = ?
-                ORDER BY e.id
-                """,
-                (kind,),
+                base + " WHERE e.kind IN ('正向', '补正向') ORDER BY e.id"
             ).fetchall()
+        elif kind:
+            rows = conn.execute(base + " WHERE e.kind = ? ORDER BY e.id", (kind,)).fetchall()
         else:
-            rows = conn.execute(
-                """
-                SELECT e.*, a.code AS account_code, a.name AS account_name
-                FROM ledger_entries e
-                JOIN accounts a ON a.id = e.account_id
-                ORDER BY e.id
-                """
-            ).fetchall()
+            rows = conn.execute(base + " ORDER BY e.id").fetchall()
         return rows_to_dicts(rows)
 
 
@@ -91,13 +123,20 @@ def list_settle_runs() -> list[dict]:
 
 def list_verify_reports() -> list[dict]:
     with connect() as conn:
-        return rows_to_dicts(
+        rows = rows_to_dicts(
             conn.execute("SELECT * FROM verify_reports ORDER BY id DESC").fetchall()
         )
+        for r in rows:
+            r["detail"] = json.loads(r["detail_json"])
+        return rows
 
 
 def run_settle() -> dict:
-    """底座冒烟：按账户汇总正向−已匹配冲正；无原单/超额冲正进隔离；余额写账户。"""
+    """底座冒烟：按账户汇总正向−已匹配冲正；无原单/超额冲正进隔离；余额写账户。
+
+    「补正向」登记时已直接进入已归并，不参与本轮 FIFO；本轮的余额写与净额统计
+    仍按账户全量已归并流水重算，保证与流水/对消/余额同源。
+    """
     with connect() as conn:
         now = _now()
         cur = conn.execute(
@@ -133,13 +172,19 @@ def run_settle() -> dict:
         for r in reversals:
             target = r.get("target_entry_key")
             if not target or target not in fwd_by_key:
+                reason = "冲正无原单"
+                if target and conn.execute(
+                    "SELECT 1 FROM ledger_entries WHERE entry_key = ? AND kind = '补正向'",
+                    (target,),
+                ).fetchone():
+                    reason = "冲正不得抢占补正向"
                 conn.execute(
                     """
                     INSERT INTO quarantine_items(
                       entry_key, account_id, reason, amount_cents, settle_run_id, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (r["entry_key"], r["account_id"], "冲正无原单", r["amount_cents"], run_id, now),
+                    (r["entry_key"], r["account_id"], reason, r["amount_cents"], run_id, now),
                 )
                 conn.execute(
                     "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
@@ -167,13 +212,18 @@ def run_settle() -> dict:
 
             remain = fwd["amount_cents"] - used[target]
             if r["amount_cents"] > remain:
+                reason = "冲正超额"
+                if conn.execute(
+                    "SELECT 1 FROM offset_edges WHERE reverse_entry_key = ?", (r["entry_key"],)
+                ).fetchone():
+                    reason = "冲正已被补正向对消绑定"
                 conn.execute(
                     """
                     INSERT INTO quarantine_items(
                       entry_key, account_id, reason, amount_cents, settle_run_id, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (r["entry_key"], r["account_id"], "冲正超额", r["amount_cents"], run_id, now),
+                    (r["entry_key"], r["account_id"], reason, r["amount_cents"], run_id, now),
                 )
                 conn.execute(
                     "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
@@ -198,12 +248,18 @@ def run_settle() -> dict:
             settled += 1
 
         net_total = 0
-        for acc_id, net in account_net.items():
+        touched = set(account_net)
+        touched |= {
+            r["account_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT account_id FROM ledger_entries WHERE kind = '补正向'"
+            ).fetchall()
+        }
+        for acc_id in sorted(touched):
+            net_total += recompute_account_balance(conn, acc_id)
             conn.execute(
-                "UPDATE accounts SET balance_cents = ?, last_settle_run_id = ? WHERE id = ?",
-                (net, run_id, acc_id),
+                "UPDATE accounts SET last_settle_run_id = ? WHERE id = ?", (run_id, acc_id)
             )
-            net_total += net
 
         # 无流水账户余额清零（本轮未触及则保持；底座简化：仅写触及账户）
         finished = _now()
@@ -252,11 +308,11 @@ def run_verify(settle_run_id: int | None = None) -> dict:
         if not run:
             raise HTTPException(404, "归并运行不存在")
 
-        # 已归并正向 − 已归并冲正
+        # 已归并正向（含补正向）− 已归并冲正
         fwd_sum = conn.execute(
             """
             SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries
-            WHERE kind = '正向' AND status = '已归并' AND settle_run_id = ?
+            WHERE kind IN ('正向', '补正向') AND status = '已归并' AND settle_run_id = ?
             """,
             (settle_run_id,),
         ).fetchone()["s"]
@@ -280,14 +336,25 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             (settle_run_id,),
         ).fetchone()["c"]
 
-        # 全量已归并净额
+        # 全量已归并净额（正向 + 补正向 − 冲正）
         all_fwd = conn.execute(
-            "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries WHERE kind = '正向' AND status = '已归并'"
+            "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries WHERE kind IN ('正向', '补正向') AND status = '已归并'"
         ).fetchone()["s"]
         all_rev = conn.execute(
             "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries WHERE kind = '冲正' AND status = '已归并'"
         ).fetchone()["s"]
         all_ledger_net = all_fwd - all_rev
+
+        comp_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM ledger_entries WHERE kind = '补正向'"
+        ).fetchone()["c"]
+        comp_sum = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries WHERE kind = '补正向'"
+        ).fetchone()["s"]
+        edge_count = conn.execute("SELECT COUNT(*) AS c FROM offset_edges").fetchone()["c"]
+        edge_sum = conn.execute(
+            "SELECT COALESCE(SUM(offset_cents), 0) AS s FROM offset_edges"
+        ).fetchone()["s"]
 
         consistent = 1 if all_ledger_net == all_bal else 0
         detail = {
@@ -298,6 +365,10 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "全量流水净额分": all_ledger_net,
             "全量账户余额分": all_bal,
             "本轮隔离数": q_count,
+            "补正向笔数": comp_count,
+            "补正向金额分": comp_sum,
+            "对消边数": edge_count,
+            "对消分合计": edge_sum,
         }
         now = _now()
         cur = conn.execute(
